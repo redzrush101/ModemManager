@@ -24,9 +24,154 @@
 #include "ModemManager.h"
 #include "mm-log.h"
 #include "mm-iface-modem.h"
+#include "mm-shared-qmi.h"
+#include "mm-modem-helpers-qcom-soc.h"
 #include "mm-broadband-modem-qmi-qcom-soc.h"
 
-G_DEFINE_TYPE (MMBroadbandModemQmiQcomSoc, mm_broadband_modem_qmi_qcom_soc, MM_TYPE_BROADBAND_MODEM_QMI)
+static void iface_modem_init (MMIfaceModemInterface *iface);
+static MMIfaceModemInterface *iface_modem_parent;
+
+G_DEFINE_TYPE_EXTENDED (MMBroadbandModemQmiQcomSoc, mm_broadband_modem_qmi_qcom_soc, MM_TYPE_BROADBAND_MODEM_QMI, 0,
+                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init))
+
+/*****************************************************************************/
+/* Select a primary GW SIM application before querying its lock state. */
+
+static MMModemLock
+load_unlock_required_finish (MMIfaceModem  *self,
+                             GAsyncResult  *res,
+                             GError       **error)
+{
+    gssize value;
+
+    value = g_task_propagate_int (G_TASK (res), error);
+    return value < 0 ? MM_MODEM_LOCK_UNKNOWN : (MMModemLock) value;
+}
+
+static void
+parent_load_unlock_required_ready (MMIfaceModem *self,
+                                   GAsyncResult *res,
+                                   GTask        *task)
+{
+    MMModemLock lock;
+    GError *error = NULL;
+
+    lock = iface_modem_parent->load_unlock_required_finish (self, res, &error);
+    if (error)
+        g_task_return_error (task, error);
+    else
+        g_task_return_int (task, lock);
+    g_object_unref (task);
+}
+
+static void
+parent_load_unlock_required (GTask *task)
+{
+    if (g_task_return_error_if_cancelled (task)) {
+        g_object_unref (task);
+        return;
+    }
+
+    iface_modem_parent->load_unlock_required (g_task_get_source_object (task),
+                                            GPOINTER_TO_INT (g_task_get_task_data (task)),
+                                            g_task_get_cancellable (task),
+                                            (GAsyncReadyCallback) parent_load_unlock_required_ready,
+                                            task);
+}
+
+static void
+change_provisioning_session_ready (QmiClientUim *client,
+                                   GAsyncResult *res,
+                                   GTask        *task)
+{
+    g_autoptr(QmiMessageUimChangeProvisioningSessionOutput) output = NULL;
+    GError *error = NULL;
+
+    output = qmi_client_uim_change_provisioning_session_finish (client, res, &error);
+    if (!output || !qmi_message_uim_change_provisioning_session_output_get_result (output, &error)) {
+        g_prefix_error (&error, "Couldn't activate primary GW SIM application: ");
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    parent_load_unlock_required (task);
+}
+
+static void
+get_card_status_ready (QmiClientUim *client,
+                       GAsyncResult *res,
+                       GTask        *task)
+{
+    g_autoptr(QmiMessageUimGetCardStatusOutput) output = NULL;
+    g_autoptr(QmiMessageUimChangeProvisioningSessionInput) input = NULL;
+    GError *error = NULL;
+    guint16 index_gw_primary;
+    GArray *cards;
+    GArray *aid;
+    guint8 slot;
+
+    output = qmi_client_uim_get_card_status_finish (client, res, &error);
+    if (!output || !qmi_message_uim_get_card_status_output_get_result (output, &error) ||
+        !qmi_message_uim_get_card_status_output_get_card_status (output, &index_gw_primary,
+                                                              NULL, NULL, NULL, &cards, &error)) {
+        /* Older firmware may support only DMS UIM commands. Let the parent
+         * handle that case, but always honor cancellation. */
+        if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+            g_task_return_error (task, error);
+            g_object_unref (task);
+            return;
+        }
+        mm_obj_dbg (g_task_get_source_object (task), "couldn't check primary GW session: %s", error->message);
+        g_clear_error (&error);
+        parent_load_unlock_required (task);
+        return;
+    }
+
+    if (!mm_qcom_soc_select_uim_application (index_gw_primary, cards, &slot, &aid)) {
+        parent_load_unlock_required (task);
+        return;
+    }
+
+    if (g_task_return_error_if_cancelled (task)) {
+        g_object_unref (task);
+        return;
+    }
+
+    mm_obj_dbg (g_task_get_source_object (task), "activating primary GW SIM application on slot %u", slot);
+    input = qmi_message_uim_change_provisioning_session_input_new ();
+    qmi_message_uim_change_provisioning_session_input_set_session_change (
+        input, QMI_UIM_SESSION_TYPE_PRIMARY_GW_PROVISIONING, TRUE, NULL);
+    qmi_message_uim_change_provisioning_session_input_set_application_information (input, slot, aid, NULL);
+    qmi_client_uim_change_provisioning_session (client, input, 10,
+                                              g_task_get_cancellable (task),
+                                              (GAsyncReadyCallback) change_provisioning_session_ready,
+                                              task);
+}
+
+static void
+load_unlock_required (MMIfaceModem        *self,
+                      gboolean             last_attempt,
+                      GCancellable        *cancellable,
+                      GAsyncReadyCallback  callback,
+                      gpointer             user_data)
+{
+    QmiClient *client;
+    GTask *task;
+
+    task = g_task_new (self, cancellable, callback, user_data);
+    g_task_set_task_data (task, GINT_TO_POINTER (last_attempt), NULL);
+
+    client = mm_shared_qmi_peek_client (MM_SHARED_QMI (self), QMI_SERVICE_UIM,
+                                      MM_PORT_QMI_FLAG_DEFAULT, NULL);
+    if (!client) {
+        parent_load_unlock_required (task);
+        return;
+    }
+
+    qmi_client_uim_get_card_status (QMI_CLIENT_UIM (client), NULL, 5, cancellable,
+                                  (GAsyncReadyCallback) get_card_status_ready, task);
+}
 
 /*****************************************************************************/
 
@@ -175,4 +320,12 @@ mm_broadband_modem_qmi_qcom_soc_class_init (MMBroadbandModemQmiQcomSocClass *kla
     MMBroadbandModemQmiClass *broadband_modem_qmi_class = MM_BROADBAND_MODEM_QMI_CLASS (klass);
 
     broadband_modem_qmi_class->peek_port_qmi_for_data = peek_port_qmi_for_data;
+}
+
+static void
+iface_modem_init (MMIfaceModemInterface *iface)
+{
+    iface_modem_parent = g_type_interface_peek_parent (iface);
+    iface->load_unlock_required = load_unlock_required;
+    iface->load_unlock_required_finish = load_unlock_required_finish;
 }

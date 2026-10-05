@@ -876,6 +876,7 @@ if plugins_options['qcom-soc']
 
   sources = files(
     'qcom-soc/mm-broadband-modem-qmi-qcom-soc.c',
+    'qcom-soc/mm-modem-helpers-qcom-soc.c',
     'qcom-soc/mm-plugin-qcom-soc.c',
   )
 
@@ -885,6 +886,16 @@ if plugins_options['qcom-soc']
   }}
 
   plugins_udev_rules += files('qcom-soc/77-mm-qcom-soc.rules')
+
+  if enable_tests
+    exe = executable(
+      'test-qcom-soc-uim',
+      sources: ['qcom-soc/tests/test-qcom-soc-uim.c', 'qcom-soc/mm-modem-helpers-qcom-soc.c'],
+      include_directories: 'qcom-soc',
+      dependencies: qmi_glib_dep,
+    )
+    test('test-qcom-soc-uim', exe)
+  endif
 endif
 
 # plugin: quectel
